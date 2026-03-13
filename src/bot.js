@@ -6,6 +6,11 @@ const {
   ChannelType,
   ThreadAutoArchiveDuration,
   Events,
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 
 const config = require('./config');
@@ -23,9 +28,9 @@ function log(level, message) {
   }
 }
 
-async function createSession(thread, userId, workingDir) {
+async function createSession(thread, userId, workingDir, statusMessageId = null) {
   const sessionId = `${thread.id}`;
-  
+
   const processManager = new ProcessManager({
     cliPath: config.omo.cliPath,
     workingDir: workingDir || config.omo.workingDir,
@@ -35,20 +40,74 @@ async function createSession(thread, userId, workingDir) {
   });
 
   processManager.onOutput = async (chunk) => {
-    try {
-      await thread.send(chunk);
-    } catch (err) {
-      log('error', `Failed to send message to thread ${thread.id}: ${err.message}`);
-    }
+    const session = SESSIONS.get(sessionId);
+    if (!session || !session.statusMessageId) return;
+
+    // Chain to editQueue for sequential processing
+    session.editQueue = session.editQueue.then(async () => {
+      try {
+        const statusMsg = await thread.messages.fetch(session.statusMessageId);
+
+        // Get rolling buffer content
+        const content = processManager.sanitizer.getLastNChars(config.embed.maxDescLength);
+
+        // Build updated embed
+        const updatedEmbed = EmbedBuilder.from(statusMsg.embeds[0])
+          .setDescription(`\`\`\`bash\n${content}\n\`\`\``)
+          .setTimestamp();
+
+        await statusMsg.edit({ embeds: [updatedEmbed] });
+
+        // Rate limit protection delay
+        await new Promise(r => setTimeout(r, config.embed.minEditIntervalMs));
+      } catch (err) {
+        log('error', `Failed to update embed: ${err.message}`);
+      }
+    });
   };
 
   processManager.onExit = async (code) => {
-    try {
-      await thread.send(`Process exited with code ${code}.`);
-      SESSIONS.delete(sessionId);
-    } catch (err) {
-      log('error', `Failed to send exit message: ${err.message}`);
+    const session = SESSIONS.get(sessionId);
+    
+    if (session && session.statusMessageId) {
+      try {
+        const statusMsg = await thread.messages.fetch(session.statusMessageId);
+        const isSuccess = code === 0;
+        
+        const updatedEmbed = EmbedBuilder.from(statusMsg.embeds[0])
+          .setTitle('CLI Session - Ended')
+          .setColor(isSuccess ? 0x57F287 : 0xED4245)
+          .spliceFields(1, 1, { name: 'Status', value: isSuccess ? '✅ Completed' : '❌ Error', inline: true });
+        
+        const disabledButtons = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder()
+              .setCustomId('btn_approve')
+              .setLabel('✓ Approve')
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId('btn_reject')
+              .setLabel('✗ Reject')
+              .setStyle(ButtonStyle.Danger)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId('btn_stop')
+              .setLabel('⏹ Stop')
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(true)
+          );
+        
+        await statusMsg.edit({ 
+          embeds: [updatedEmbed], 
+          components: [disabledButtons] 
+        });
+      } catch (err) {
+        log('error', `Failed to update exit status: ${err.message}`);
+      }
     }
+    
+    SESSIONS.delete(sessionId);
   };
 
   processManager.onError = async (err) => {
@@ -63,6 +122,8 @@ async function createSession(thread, userId, workingDir) {
     threadId: thread.id,
     userId,
     processManager,
+    statusMessageId,
+    editQueue: Promise.resolve(),
     createdAt: Date.now(),
   });
 
@@ -97,6 +158,108 @@ function getSessionCountForUser(userId) {
     }
   }
   return count;
+}
+
+async function handleProjectSelect(interaction) {
+  const workingDir = interaction.values[0];
+  const userId = interaction.user.id;
+  const userSessionCount = getSessionCountForUser(userId);
+
+  if (userSessionCount >= config.thread.maxSessionsPerUser) {
+    return interaction.reply({
+      content: `You have reached the maximum of ${config.thread.maxSessionsPerUser} concurrent sessions.`,
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const threadName = `session-${userId.slice(-6)}-${Date.now().toString(36)}`;
+
+  try {
+    const thread = await interaction.channel.threads.create({
+      name: threadName,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+      type: ChannelType.PrivateThread,
+      reason: `OpenCode session for ${interaction.user.username}`,
+    });
+
+    await thread.members.add(userId);
+
+    const statusEmbed = new EmbedBuilder()
+      .setTitle('CLI Session')
+      .setDescription('```\nInitializing...\n```')
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'Project', value: workingDir, inline: true },
+        { name: 'Status', value: '🟢 Running', inline: true }
+      )
+      .setTimestamp();
+
+    const buttons = new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('btn_approve')
+          .setLabel('✓ Approve')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId('btn_reject')
+          .setLabel('✗ Reject')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('btn_stop')
+          .setLabel('⏹ Stop')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+    const statusMsg = await thread.send({
+      embeds: [statusEmbed],
+      components: [buttons]
+    });
+
+    const processManager = await createSession(thread, userId, workingDir, statusMsg.id);
+    await processManager.spawn();
+
+    await interaction.editReply(`Session started in ${thread}`);
+    log('info', `Created session ${thread.id} for user ${userId}`);
+  } catch (err) {
+    log('error', `Failed to create session: ${err.message}`);
+    await interaction.editReply(`Failed to create session: ${err.message}`);
+  }
+}
+
+async function handleButtonInteraction(interaction) {
+  const threadId = interaction.channel?.id;
+  const session = SESSIONS.get(threadId);
+
+  if (!session) {
+    return interaction.reply({ content: 'No active session.', ephemeral: true });
+  }
+
+  if (session.userId !== interaction.user.id) {
+    return interaction.reply({ content: 'Only session owner can interact.', ephemeral: true });
+  }
+
+  if (!session.processManager.isRunning) {
+    return interaction.reply({ content: 'Session is not running.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  switch (interaction.customId) {
+    case 'btn_approve':
+      session.processManager.sendInput(config.omo.approveText);
+      await interaction.deleteReply();
+      break;
+    case 'btn_reject':
+      session.processManager.sendInput(config.omo.rejectText);
+      await interaction.deleteReply();
+      break;
+    case 'btn_stop':
+      await session.processManager.kill();
+      await interaction.editReply('Session stopped.');
+      break;
+  }
 }
 
 async function handleStartCommand(message, args) {
@@ -203,8 +366,40 @@ async function main() {
     ],
   });
 
-  client.once(Events.ClientReady, () => {
+  client.once(Events.ClientReady, async () => {
     log('info', `Bot logged in as ${client.user.tag}`);
+    
+    // Send project picker
+    const channel = await client.channels.fetch(config.discord.channelId);
+    
+    // Check for existing picker (search last 10 messages)
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const existingPicker = messages.find(m => 
+      m.author.id === client.user.id && 
+      m.embeds.length > 0 &&
+      m.embeds[0].title?.includes('Select Project')
+    );
+    
+    if (!existingPicker) {
+      const embed = new EmbedBuilder()
+        .setTitle('Oh My OpenCode - Select Project')
+        .setDescription('Choose a project to start a development session')
+        .setColor(0x5865F2);
+      
+      const selectMenu = new StringSelectMenuBuilder()
+        .setCustomId('select_project')
+        .setPlaceholder('Choose a project...')
+        .addOptions(
+          config.omo.projectPaths.map(path => ({
+            label: path.split('/').pop() || path,
+            description: path,
+            value: path
+          }))
+        );
+      
+      const row = new ActionRowBuilder().addComponents(selectMenu);
+      await channel.send({ embeds: [embed], components: [row] });
+    }
   });
 
   client.on(Events.MessageCreate, async (message) => {
@@ -229,6 +424,14 @@ async function main() {
       session.processManager.kill();
       SESSIONS.delete(thread.id);
       log('info', `Cleaned up session ${thread.id} due to thread deletion`);
+    }
+  });
+
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isStringSelectMenu() && interaction.customId === 'select_project') {
+      await handleProjectSelect(interaction);
+    } else if (interaction.isButton()) {
+      await handleButtonInteraction(interaction);
     }
   });
 

@@ -67,6 +67,13 @@ class StreamSanitizer extends EventEmitter {
   getPendingBuffer() {
     return this.buffer;
   }
+
+  getLastNChars(n) {
+    if (this.buffer.length <= n) {
+      return this.buffer;
+    }
+    return this.buffer.slice(-n);
+  }
 }
 
 module.exports = { StreamSanitizer };

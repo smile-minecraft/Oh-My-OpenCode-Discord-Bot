@@ -23,6 +23,10 @@ class ProcessManager {
     this.isRunning = false;
   }
 
+  get sanitizer() {
+    return this.sanitizer;
+  }
+
   async spawn(args = []) {
     if (this.isRunning) {
       throw new Error('Process already running. Kill it first before spawning a new one.');

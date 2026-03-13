@@ -74,6 +74,17 @@ const config = {
     cliPath: env('OMO_CLI_PATH', '/usr/local/bin/omo'),
     workingDir: env('OMO_WORKING_DIR', process.cwd()),
     envVars: env('OMO_ENV_VARS', ''),
+    projectPaths: env('PROJECT_PATHS_JSON') 
+      ? JSON.parse(env('PROJECT_PATHS_JSON')) 
+      : env('PROJECT_PATHS', '').split(',').filter(p => p.trim()),
+    approveText: env('APPROVE_TEXT', 'y'),
+    rejectText: env('REJECT_TEXT', 'n'),
+  },
+  
+  embed: {
+    updateIntervalMs: envInt('EMBED_UPDATE_INTERVAL_MS', 2000),
+    maxDescLength: envInt('MAX_EMBED_DESC_LENGTH', 3800),
+    minEditIntervalMs: envInt('MIN_EDIT_INTERVAL_MS', 1000),
   },
   
   // Buffer and streaming configuration
