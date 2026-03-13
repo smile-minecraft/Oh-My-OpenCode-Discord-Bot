@@ -1,78 +1,105 @@
 'use strict';
 
 const { spawn } = require('child_process');
-const { StreamSanitizer } = require('./StreamSanitizer');
 
-/**
- * ProcessManager handles the lifecycle of Oh My OpenCode CLI processes.
- * Spawns child processes, manages stdio streams, and coordinates
- * output sanitization for Discord message delivery.
- */
 class ProcessManager {
   constructor(options = {}) {
-    this.cliPath = options.cliPath || '/usr/local/bin/omo';
+    this.cliPath = options.cliPath || 'opencode';
     this.workingDir = options.workingDir || process.cwd();
-    this.envVars = options.envVars || {};
-    this.sanitizerOptions = {
-      charLimit: options.bufferCharLimit || 1900,
-      flushIntervalMs: options.bufferFlushIntervalMs || 500,
-    };
-    
+    this.port = options.port || 4096;
     this.process = null;
-    this.sanitizer = null;
     this.isRunning = false;
+    this.baseUrl = `http://127.0.0.1:${this.port}`;
   }
 
-  get sanitizer() {
-    return this.sanitizer;
-  }
-
-  async spawn(args = []) {
+  async spawn() {
     if (this.isRunning) {
-      throw new Error('Process already running. Kill it first before spawning a new one.');
+      throw new Error('Server already running.');
     }
 
-    this.sanitizer = new StreamSanitizer(this.sanitizerOptions);
-    this.sanitizer.on('output', (chunk) => this.emitOutput(chunk));
-    
-    const env = {
-      ...process.env,
-      ...this.envVars,
-      FORCE_COLOR: '0',
-      NO_COLOR: '1',
-      TERM: 'dumb',
-    };
-
-    this.process = spawn(this.cliPath, args, {
+    this.process = spawn(this.cliPath, ['serve', '--port', this.port.toString()], {
       cwd: this.workingDir,
-      env,
+      env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
 
     this.isRunning = true;
-    this.sanitizer.start();
 
-    this.process.stdout?.on('data', (data) => {
-      this.sanitizer.write(data);
-    });
-
-    this.process.stderr?.on('data', (data) => {
-      this.sanitizer.write(data);
-    });
+    await this.waitForServer();
 
     this.process.on('close', (code) => {
-      this.handleExit(code);
+      this.isRunning = false;
+      if (this.onExit) this.onExit(code);
     });
 
     this.process.on('error', (err) => {
-      this.handleError(err);
+      this.isRunning = false;
+      if (this.onError) this.onError(err);
     });
 
-    return {
-      pid: this.process.pid,
-      stdin: this.process.stdin,
-    };
+    return { pid: this.process.pid };
+  }
+
+  async waitForServer(maxAttempts = 30) {
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const response = await fetch(`${this.baseUrl}/global/health`);
+        if (response.ok) {
+          return;
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 500));
+    }
+    throw new Error('Server failed to start within timeout');
+  }
+
+  async createSession(title) {
+    const response = await fetch(`${this.baseUrl}/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to create session: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async sendMessage(sessionId, text) {
+    const response = await fetch(`${this.baseUrl}/session/${sessionId}/prompt_async`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        parts: [{ type: 'text', text }],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to send message: ${response.statusText}`);
+    }
+
+    return true;
+  }
+
+  async getMessages(sessionId) {
+    const response = await fetch(`${this.baseUrl}/session/${sessionId}/message`);
+
+    if (!response.ok) {
+      throw new Error(`Failed to get messages: ${response.statusText}`);
+    }
+
+    return await response.json();
+  }
+
+  async deleteSession(sessionId) {
+    const response = await fetch(`${this.baseUrl}/session/${sessionId}`, {
+      method: 'DELETE',
+    });
+
+    return response.ok;
   }
 
   async kill(signal = 'SIGTERM', timeoutMs = 5000) {
@@ -88,7 +115,7 @@ class ProcessManager {
     this.process.kill(signal);
 
     await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
+      const timer = setTimeout(() => {
         if (!this.process.killed) {
           this.process.kill('SIGKILL');
         }
@@ -96,7 +123,7 @@ class ProcessManager {
       }, timeoutMs);
 
       this.process.once('close', () => {
-        clearTimeout(timeout);
+        clearTimeout(timer);
         resolve();
       });
     });
@@ -104,50 +131,21 @@ class ProcessManager {
     this.cleanup();
   }
 
-  sendInput(input) {
-    if (!this.isRunning || !this.process?.stdin) {
-      throw new Error('Process not running. Cannot send input.');
-    }
-
-    this.process.stdin.write(input + '\n');
-  }
-
-  emitOutput(chunk) {
-    if (this.onOutput) {
-      this.onOutput(chunk);
-    }
-  }
-
-  handleExit(code) {
-    this.sanitizer?.stop();
-    this.isRunning = false;
-    
-    if (this.onExit) {
-      this.onExit(code);
-    }
-  }
-
-  handleError(err) {
-    this.sanitizer?.stop();
-    this.isRunning = false;
-    
-    if (this.onError) {
-      this.onError(err);
-    }
-  }
-
   cleanup() {
-    this.sanitizer?.stop();
-    this.sanitizer = null;
     this.process = null;
     this.isRunning = false;
+  }
+
+  sendInput(input) {
+    throw new Error('sendInput is not supported in serve mode. Use sendMessage() instead.');
   }
 
   getStatus() {
     return {
       isRunning: this.isRunning,
       pid: this.process?.pid || null,
-      pendingBuffer: this.sanitizer?.getPendingBuffer() || '',
+      port: this.port,
+      baseUrl: this.baseUrl,
     };
   }
 }

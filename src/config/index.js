@@ -98,7 +98,13 @@ const config = {
     autoArchiveDuration: envInt('THREAD_AUTO_ARCHIVE_DURATION', 1440),
     maxSessionsPerUser: envInt('MAX_SESSIONS_PER_USER', 3),
   },
-  
+
+  // Port configuration for opencode serve
+  port: {
+    startPort: envInt('PORT_START', 4096),
+    endPort: envInt('PORT_END', 5096),
+  },
+
   // General configuration
   general: {
     logLevel: env('LOG_LEVEL', 'info'),
